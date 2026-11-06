@@ -1,0 +1,183 @@
+---
+title: "Is an automatic or manual transmission better for MPG? An analysis of `mtcars`"
+author: "Simon Malone"
+date: "2026-11-06"
+output: pdf_document
+geometry: margin=0.7in
+fontsize: 10pt
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+f  <- function(x, k = 2) formatC(x, format = "f", digits = k)
+fp <- function(p) ifelse(p < 0.001, "< 0.001", f(p, 3))
+r100 <- function(w) format(round(1000 * w, -2), big.mark = ",", scientific = FALSE)  # 1000 lb -> nearest 100 lb
+
+data(mtcars)
+raw <- mtcars                                   # numeric version for correlations / VIF
+d <- mtcars
+d$am  <- factor(d$am, labels = c("Automatic", "Manual"))
+d$cyl <- factor(d$cyl)
+mw <- mean(d$wt); d$wtc <- d$wt - mw            # centred weight (1000 lb)
+
+# Candidate models (transmission is always kept in)
+m1 <- lm(mpg ~ am, d)
+m2 <- lm(mpg ~ am + wt, d)
+m3 <- lm(mpg ~ am + wt + qsec, d)
+m4 <- lm(mpg ~ am + wt + qsec + hp, d)
+mfull <- lm(mpg ~ ., d[, setdiff(names(d), "wtc")])
+mstep <- step(mfull, scope = list(lower = ~ am, upper = formula(mfull)), trace = 0)
+m6    <- lm(mpg ~ am * wtc + qsec, d)           # chosen model (same fit as am*wt + qsec)
+m6hp  <- update(m6, . ~ . + hp)
+an     <- anova(m1, m2, m3, m4, mfull)
+an_int <- anova(m3, lm(mpg ~ am * wt + qsec, d)) # interaction vs. am + wt + qsec
+an_hp  <- anova(m6, m6hp)
+
+amest <- function(m) c(coef(m)["amManual"], confint(m)["amManual", ])
+aic   <- function(m) extractAIC(m)[2]
+adjr  <- function(m) summary(m)$adj.r.squared
+
+# EDA numbers
+grp <- tapply(d$mpg, d$am, mean)
+tt  <- t.test(mpg ~ am, data = d)               # Welch; Automatic - Manual
+raw_diff <- unname(grp["Manual"] - grp["Automatic"])
+raw_ci   <- sort(-tt$conf.int)
+wt_grp <- tapply(d$wt, d$am, mean)
+cm <- cor(raw)["mpg", ]
+
+# Final model numbers
+s6 <- summary(m6); cf <- coef(s6); ci <- confint(m6)
+V6 <- vcov(m6)
+eff <- function(w) {                            # manual - automatic effect at weight w (1000 lb)
+  cvec <- c(0, 1, 0, 0, w - mw)                 # order: (Intercept), am, wtc, qsec, am:wtc
+  e <- sum(cvec * coef(m6)); se <- sqrt(drop(t(cvec) %*% V6 %*% cvec))
+  tq <- qt(0.975, df.residual(m6))
+  c(est = e, lo = e - tq * se, hi = e + tq * se)
+}
+e25 <- eff(2.5); e30 <- eff(3.0)
+ws <- seq(1.5, 3.6, by = 0.001)
+E  <- t(sapply(ws, eff))
+w_zero <- ws[which(E[, "est"] < 0)[1]]          # where estimated effect crosses zero
+w_sig  <- ws[which(E[, "lo"] < 0)[1]]           # where CI lower bound crosses zero
+mean_eff <- eff(mw)
+slope_man <- cf["wtc", 1] + cf["amManual:wtc", 1]
+
+# Diagnostics
+r2 <- resid(m6)^2
+bp_LM <- nobs(m6) * summary(lm(r2 ~ fitted(m6)))$r.squared
+bp_p  <- pchisq(bp_LM, 1, lower.tail = FALSE)
+sh_p  <- shapiro.test(resid(m6))$p.value
+cook  <- cooks.distance(m6); hat <- hatvalues(m6)
+# Robustness of the interaction: leave-one-out and dropping the 5 highest-leverage cars
+refit <- function(dd) {
+  a <- lm(mpg ~ am * wt + qsec, dd); b <- lm(mpg ~ am + wt + qsec, dd)
+  c(p = summary(a)$coefficients["amManual:wt", 4], daic = extractAIC(b)[2] - extractAIC(a)[2])
+}
+loo  <- t(sapply(seq_len(nrow(d)), function(i) refit(d[-i, ])))
+top5 <- order(hatvalues(m6), decreasing = TRUE)[1:5]
+t5   <- refit(d[-top5, ])
+Xv <- model.matrix(m6)[, -1]
+vif <- sapply(seq_len(ncol(Xv)), function(j) 1 / (1 - summary(lm(Xv[, j] ~ Xv[, -j]))$r.squared))
+```
+
+**Executive summary.** *Motor Trend* asked whether automatic or manual transmissions are better for fuel economy and by how much. In the 32 cars of the `mtcars` dataset, manual cars average `r f(grp["Manual"],1)` mpg versus `r f(grp["Automatic"],1)` mpg for automatics, a gap of `r f(raw_diff,1)` mpg (95% CI `r f(raw_ci[1],1)` to `r f(raw_ci[2],1)`). Most of that gap is confounding: the manual cars in this sample are lighter and have smaller engines. After adjusting for weight and quarter-mile time, the best-fitting model shows that the manual advantage depends on weight: about **`r f(e25["est"],1)` mpg for a 2,500 lb car** (95% Confidence Interval (CI) `r f(e25["lo"],1)` to `r f(e25["hi"],1)`), `r f(e30["est"],1)` mpg at 3,000 lb (`r f(e30["lo"],1)` to `r f(e30["hi"],1)`), and no detectable advantage above roughly 3,000 lb. At the sample's average weight (`r f(1000*mw,0)` lb) the difference is only `r f(mean_eff["est"],1)` mpg (`r f(mean_eff["lo"],1)` to `r f(mean_eff["hi"],1)`). So manual transmissions look better for lighter cars but the benefit is modest, uncertain and absent for heavier cars.
+
+## Exploratory analysis
+
+The dataset holds  mpg (outcome) and 10 predictors for 32 cars, `r sum(d$am=="Automatic")` automatic and `r sum(d$am=="Manual")` manual. Manual cars have clearly higher mpg (Fig. 1A) but transmission is entangled with car size. MPG is most strongly correlated with weight (r = `r f(cm["wt"])`), cylinders (`r f(cm["cyl"])`), displacement (`r f(cm["disp"])`) and horsepower (`r f(cm["hp"])`) (Fig. 2). Manual cars are much lighter (mean `r f(wt_grp["Manual"])` vs `r f(wt_grp["Automatic"])` thousand lb), `r sum(d$am=="Manual" & d$cyl==4)` of 13 have four cylinders, while `r sum(d$am=="Automatic" & d$cyl==8)` of 19 automatics have eight (Fig. 1B). A naive comparison therefore credits the gearbox with an advantage that mostly belongs to lighter, smaller cars. Many predictors are also highly correlated with each other, so including all of them risks unstable estimates.
+
+## Model selection
+
+Transmission was kept in every model. I started from `mpg ~ am` and added candidate confounders one at a time, judging each step with nested F-tests, and cross-checked with backward elimination by AIC from all 10 predictors. Adding weight improved the fit substantially (F = `r f(an$F[2],1)`, p `r fp(an$"Pr(>F)"[2])`), as did quarter-mile time `qsec` (F = `r f(an$F[3],1)`, p `r fp(an$"Pr(>F)"[3])`), while horsepower (F = `r f(an$F[4])`, p = `r f(an$"Pr(>F)"[4])`) and the remaining variables (F = `r f(an$F[5])`, p = `r f(an$"Pr(>F)"[5])`) did not; backward AIC agreed giving `r format(formula(mstep))`. Since weight is the main confounder, I then tested whether the transmission effect varies with weight. Adding an `am:wt` interaction to that model improved it clearly (F = `r f(an_int$F[2],1)`, p = `r f(an_int$"Pr(>F)"[2],3)`; AIC `r f(aic(m6),1)` vs `r f(aic(m3),1)`; adjusted R^2^ `r f(adjr(m6))` vs `r f(adjr(m3))`), whereas adding horsepower on top did not (F = `r f(an_hp$F[2])`, p = `r f(an_hp$"Pr(>F)"[2])`). I therefore selected **`mpg ~ am * wt + qsec`**. Because this model was chosen after comparing several candidates on the same 32 cars, the p-values and confidence intervals are somewhat optimistic and should be read as approximate.
+
+```{r modeltab}
+ms <- list(m1, m2, m3, m4, mfull, m6)
+tab <- data.frame(
+  Model = c("1. am only", "2. am + wt", "3. am + wt + qsec", "4. am + wt + qsec + hp",
+            "5. all 10 predictors", "6. am * wt + qsec (chosen)"),
+  Diff = sapply(ms, function(m) { e <- amest(m); sprintf("%s (%s, %s)", f(e[1]), f(e[2]), f(e[3])) }),
+  AdjR2 = sapply(ms, function(m) f(adjr(m))),
+  AIC = sapply(ms, function(m) f(aic(m), 1))
+)
+tab$Diff[6] <- paste0(tab$Diff[6], "*")
+names(tab) <- c("Model", "Manual - automatic, mpg (95% CI)", "Adj. R^2", "AIC")
+knitr::kable(tab, align = "lccc")
+```
+
+\* At the mean weight (`r f(mw)` thousand lb); in model 6 the difference changes with weight (see below).
+
+## Interpretation of the chosen model
+
+Weight is centred at its mean (`r f(mw)` thousand lb) so the transmission coefficient is interpretable.
+
+```{r coeftab}
+ct <- data.frame(
+  Coefficient = c("Intercept", "Manual vs automatic, at mean weight", "Weight, automatic cars (per 1,000 lb)",
+                  "Extra weight slope for manual cars", "Quarter-mile time (per second)"),
+  Estimate = f(cf[c(1, 2, 3, 5, 4), 1]),
+  `95% CI` = sprintf("(%s, %s)", f(ci[c(1, 2, 3, 5, 4), 1]), f(ci[c(1, 2, 3, 5, 4), 2])),
+  `p-value` = fp(cf[c(1, 2, 3, 5, 4), 4]),
+  check.names = FALSE
+)
+knitr::kable(ct, align = "lccc")
+```
+
+Holding quarter-mile time fixed, each extra 1,000 lb lowers expected mpg by `r f(-cf["wtc",1])` for automatic cars and by `r f(-slope_man)` for manual cars (`r f(-cf["wtc",1])` + `r f(-cf["amManual:wtc",1])`). The manual-minus-automatic difference therefore shrinks as cars get heavier (Fig. 4B): `r f(e25["est"],1)` mpg at 2,500 lb (95% CI `r f(e25["lo"],1)` to `r f(e25["hi"],1)`), `r f(e30["est"],1)` at 3,000 lb (`r f(e30["lo"],1)` to `r f(e30["hi"],1)`) and about zero near `r r100(w_zero)` lb. The difference is statistically distinguishable from zero only below about `r r100(w_sig)` lb. Each extra second of quarter-mile time (a slower car) raises expected mpg by `r f(cf["qsec",1])`. The intercept (an average-weight automatic with a zero-second quarter-mile) has no practical meaning. The model explains `r f(100*s6$r.squared,0)`% of the variance in mpg (adjusted R^2^ = `r f(s6$adj.r.squared)`), with residual standard error `r f(s6$sigma)` mpg on `r s6$df[2]` degrees of freedom.
+
+## Residual diagnostics
+
+Residuals versus fitted values show no marked curvature and the Q-Q plot is close to linear (Shapiro-Wilk p = `r f(sh_p)`) (Fig. 3). A Breusch-Pagan test finds no evidence of heteroscedasticity (p = `r f(bp_p)`). The most influential car is the `r names(which.max(cook))` (Cook's D = `r f(max(cook))`) and the highest-leverage car is the `r names(which.max(hat))` (`r f(max(hat))`), although none exceeds a Cook's D of 0.5, so no single car drives the result. Dropping any single car (largest p-value for the interaction = `r f(max(loo[, "p"]), 3)`), or the five highest-leverage cars together (p = `r f(t5["p"], 3)`), left the interaction significant and the AIC preference unchanged. Variance inflation factors are at most `r f(max(vif),1)` (slightly raised by the interaction term), so collinearity is acceptable.
+
+## Conclusions and uncertainty
+
+**Is manual better?** For lighter cars (under about 3,000 lb), yes; for heavier cars there is no clear evidence of a difference. 
+
+**How big is the difference?** Unadjusted, `r f(raw_diff,1)` mpg (95% CI `r f(raw_ci[1],1)` to `r f(raw_ci[2],1)`). Adjusted, it ranges from about `r f(e25["est"],0)` mpg at 2,500 lb to about `r f(e30["est"],0)` mpg at 3,000 lb and roughly zero beyond `r r100(w_zero)` lb (Fig. 4). 
+
+*Caveats:* the weights of the two groups overlap only partly (no automatic car is below `r f(1000*min(d$wt[d$am=="Automatic"]),0)` lb and only `r sum(d$am=="Manual" & d$wt>3)` manual cars exceed 3,000 lb), so estimates at the extremes rely on extrapolating the fitted lines and are least reliable. The estimate is also sensitive to model choice (Fig. 4A). The data are 32 observational 1974-era cars, not a randomised comparison, so unmeasured differences between automatic and manual cars could remain and the results should not be extrapolated to modern vehicles.
+
+\newpage
+
+## Appendix: figures
+
+```{r fig1, fig.height=3.1, fig.cap="Exploratory plots. (A) MPG by transmission type. (B) MPG against weight, with separate fitted lines per transmission: manual cars are concentrated at low weights."}
+par(mfrow = c(1, 2), mar = c(4, 4, 2, 1), cex = 0.8)
+cols <- c(Automatic = "#c0504d", Manual = "#2a6fb0")
+boxplot(mpg ~ am, data = d, col = adjustcolor(cols, 0.35), ylab = "Miles per gallon", xlab = "", main = "A")
+stripchart(mpg ~ am, data = d, vertical = TRUE, method = "jitter", pch = 19, col = cols, add = TRUE)
+plot(d$wt, d$mpg, pch = 19, col = cols[d$am], xlab = "Weight (1000 lb)", ylab = "Miles per gallon", main = "B")
+for (g in levels(d$am)) abline(lm(mpg ~ wt, d[d$am == g, ]), col = cols[g], lwd = 1.5)
+legend("topright", legend = names(cols), col = cols, pch = 19, bty = "n")
+```
+
+```{r fig2, fig.height=4.2, fig.width=5, fig.cap="Correlation matrix of mpg and all predictors."}
+cr <- cor(raw); n <- ncol(cr)
+par(mar = c(4, 4, 1, 1))
+image(1:n, 1:n, cr[, n:1], col = colorRampPalette(c("#2a6fb0", "white", "#c0504d"))(41), zlim = c(-1, 1),
+      axes = FALSE, xlab = "", ylab = "")
+axis(1, 1:n, colnames(cr), las = 2); axis(2, 1:n, rev(colnames(cr)), las = 2)
+for (i in 1:n) for (j in 1:n) text(j, n + 1 - i, f(cr[i, j], 1), cex = 0.6)
+box()
+```
+
+```{r fig3, fig.height=5.4, fig.cap="Residual diagnostics for the chosen model mpg ~ am * wt + qsec."}
+par(mfrow = c(2, 2), mar = c(4, 4, 2, 1), cex = 0.8)
+plot(m6)
+```
+
+```{r fig4, fig.height=3, fig.width=7.4, fig.cap="(A) Estimated manual-minus-automatic difference (95% CI) across candidate models. (B) Estimated difference in the chosen model as a function of weight, with 95% CI band; ticks mark manual cars' weights and the shaded zone has no automatic cars."}
+par(mfrow = c(1, 2), mar = c(4, 10, 2, 1), cex = 0.8)
+mods <- list("am only" = m1, "+ wt" = m2, "+ wt + qsec" = m3, "all 10 predictors" = mfull,
+             "am*wt + qsec (chosen)\nat mean weight" = m6)
+Em <- t(sapply(mods, amest)); k <- nrow(Em)
+plot(Em[, 1], k:1, xlim = range(Em), pch = 19, yaxt = "n", ylab = "", xlab = "Manual - automatic MPG (95% CI)", main = "A")
+segments(Em[, 2], k:1, Em[, 3], k:1, lwd = 2)
+axis(2, k:1, rownames(Em), las = 1); abline(v = 0, lty = 2, col = "grey40")
+
+par(mar = c(4, 4, 2, 1))
+plot(ws, E[, "est"], type = "n", ylim = range(E), xlab = "Weight (1000 lb)", ylab = "Manual - automatic MPG", main = "B")
+rect(min(ws), par("usr")[3], min(d$wt[d$am == "Automatic"]), par("usr")[4], col = "#c0504d15", border = NA)
+polygon(c(ws, rev(ws)), c(E[, "lo"], rev(E[, "hi"])), col = "#2a6fb033", border = NA)
+lines(ws, E[, "est"], col = "#2a6fb0", lwd = 2); abline(h = 0, lty = 2, col = "grey40")
+rug(d$wt[d$am == "Manual"], col = "#2a6fb0")
+```
